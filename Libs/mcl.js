@@ -5,14 +5,84 @@
 
 class MembershipChecker {
   /**
-   * Normalizes channel input (removes @ if present)
+   * Normalizes channel input to a bare identifier (username without @, or numeric id)
+   * Accepts: "@chan", "chan", "@@chan", " https://t.me/chan "
    * @private
-   * @param {string} channel - Channel identifier
+   * @param {string|number} channel - Channel identifier
    * @returns {string} Normalized channel identifier
    */
   _normalizeChannel(channel) {
+    if (channel == null) return channel;
+    if (typeof channel === 'number') return String(channel);
+
     if (typeof channel !== 'string') return channel;
-    return channel.startsWith('@') ? channel.slice(1) : channel;
+
+    let value = channel.trim();
+    if (!value) return value;
+
+    const tmeMatch = value.match(/^(?:https?:\/\/)?t\.me\/([A-Za-z0-9_]+)\/?$/i);
+    if (tmeMatch) value = tmeMatch[1];
+
+    return value.replace(/^@+/, '');
+  }
+
+  /**
+   * Stable key for deduplicating channels (@Chan and Chan are the same)
+   * @private
+   * @param {string|number} channel - Channel identifier
+   * @returns {string}
+   */
+  _channelKey(channel) {
+    const normalized = this._normalizeChannel(channel);
+    if (typeof normalized !== 'string' || !normalized) return String(channel);
+    if (this._isPrivateChannel(normalized)) return normalized;
+    return normalized.toLowerCase();
+  }
+
+  /**
+   * Format for Telegram API chat_id (@username for public channels)
+   * @private
+   * @param {string|number} channel - Channel identifier
+   * @returns {string|number}
+   */
+  _toApiChatId(channel) {
+    const normalized = this._normalizeChannel(channel);
+    if (typeof normalized !== 'string' || !normalized) return normalized;
+    if (this._isPrivateChannel(normalized)) return normalized;
+    return '@' + normalized;
+  }
+
+  /**
+   * Consistent display label (@username for public channels)
+   * @private
+   * @param {string|number} channel - Channel identifier
+   * @returns {string}
+   */
+  _toDisplayChannel(channel) {
+    const normalized = this._normalizeChannel(channel);
+    if (typeof normalized !== 'string' || !normalized) return String(channel);
+    if (this._isPrivateChannel(normalized)) return normalized;
+    return '@' + normalized;
+  }
+
+  /**
+   * Deduplicate channels that refer to the same chat
+   * @private
+   * @param {Array<string|number>} channels
+   * @returns {Array<string|number>}
+   */
+  _dedupeChannels(channels) {
+    const seen = new Set();
+    const unique = [];
+
+    for (const channel of channels) {
+      const key = this._channelKey(channel);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      unique.push(channel);
+    }
+
+    return unique;
   }
 
   /**
@@ -55,16 +125,18 @@ class MembershipChecker {
    */
   async _processChannelCheck(userId, channel) {
     const normalizedChannel = this._normalizeChannel(channel);
+    const displayChannel = this._toDisplayChannel(channel);
+    const apiChatId = this._toApiChatId(channel);
     
     try {
       const member = await Api.getChatMember({
-        chat_id: normalizedChannel,
+        chat_id: apiChatId,
         user_id: userId
       });
 
       if (member?.ok === false || member?.message) {
         return { 
-          channel: channel,
+          channel: displayChannel,
           status: 'invalid', 
           reason: member.message || 'Channel inaccessible'
         };
@@ -74,7 +146,7 @@ class MembershipChecker {
       
       if (status === 'left' || status === 'kicked') {
         return { 
-          channel: channel,
+          channel: displayChannel,
           status: 'left',
           isPrivate: this._isPrivateChannel(normalizedChannel)
         };
@@ -82,21 +154,21 @@ class MembershipChecker {
       
       if (['member', 'administrator', 'creator'].includes(status)) {
         return { 
-          channel: channel,
+          channel: displayChannel,
           status: 'joined',
           isPrivate: this._isPrivateChannel(normalizedChannel)
         };
       }
       
       return { 
-        channel: channel,
+        channel: displayChannel,
         status: 'invalid',
         reason: `Unknown membership status: ${status}`
       };
       
     } catch (error) {
       return { 
-        channel: channel,
+        channel: displayChannel,
         status: 'invalid', 
         reason: error.message || 'Failed to check membership',
         isPrivate: this._isPrivateChannel(normalizedChannel)
@@ -112,16 +184,26 @@ class MembershipChecker {
    * 
    * @example
    * const result = await checker.check(123456789, ['@channel1', 'channel2']);
-   * console.log(result.allJoined);
+   * console.log(result.allJoined); // camelCase (legacy)
+   * console.log(result.all_joined); // snake_case (new)
    */
   async check(userId, channels) {
     this._validateChannels(channels);
+    channels = this._dedupeChannels(channels);
 
     const results = {
+      // camelCase (backward compatibility)
       allJoined: true,
       joined: [],
       left: [],
-      invalid: []
+      invalid: [],
+      
+      // snake_case (new naming convention)
+      all_joined: true,
+      joined_channels: [],
+      left_channels: [],
+      invalid_channels: [],
+      details: []
     };
 
     const channelResults = await Promise.all(
@@ -131,20 +213,50 @@ class MembershipChecker {
     for (const result of channelResults) {
       switch (result.status) {
         case 'joined':
+          // camelCase
           results.joined.push(result.channel);
+          // snake_case
+          results.joined_channels.push(result.channel);
+          results.details.push({
+            channel: result.channel,
+            status: 'joined',
+            isPrivate: result.isPrivate
+          });
           break;
           
         case 'left':
+          // camelCase
           results.left.push(result.channel);
+          // snake_case
+          results.left_channels.push(result.channel);
+          results.details.push({
+            channel: result.channel,
+            status: 'left',
+            isPrivate: result.isPrivate
+          });
           results.allJoined = false;
+          results.all_joined = false;
           break;
           
         case 'invalid':
+          // camelCase
           results.invalid.push({
             channel: result.channel,
             reason: result.reason
           });
+          // snake_case
+          results.invalid_channels.push({
+            channel: result.channel,
+            reason: result.reason
+          });
+          results.details.push({
+            channel: result.channel,
+            status: 'invalid',
+            reason: result.reason,
+            isPrivate: result.isPrivate
+          });
           results.allJoined = false;
+          results.all_joined = false;
           break;
       }
     }
@@ -163,7 +275,7 @@ class MembershipChecker {
    */
   async quick(userId, channels) {
     const result = await this.check(userId, channels);
-    return result.allJoined;
+    return result.allJoined; // camelCase (backward compatible)
   }
 
   /**
@@ -177,7 +289,7 @@ class MembershipChecker {
    */
   async getLeftChannels(userId, channels) {
     const result = await this.check(userId, channels);
-    return result.left;
+    return result.left; // camelCase (backward compatible)
   }
 
   /**
@@ -191,7 +303,7 @@ class MembershipChecker {
    */
   async getInvalidChannels(userId, channels) {
     const result = await this.check(userId, channels);
-    return result.invalid;
+    return result.invalid; // camelCase (backward compatible)
   }
 
   /**
@@ -216,18 +328,18 @@ class MembershipChecker {
     
     const config = { ...defaults, ...options };
     
-    if (result.allJoined) {
+    if (result.allJoined) { // camelCase
       return config.joinedMessage;
     }
 
     const parts = [];
     
-    if (result.left.length > 0) {
+    if (result.left.length > 0) { // camelCase
       parts.push(config.leftHeader);
       parts.push(result.left.map(channel => `  - ${channel}`).join("\n"));
     }
     
-    if (result.invalid.length > 0) {
+    if (result.invalid.length > 0) { // camelCase
       if (parts.length > 0) parts.push("");
       parts.push(config.invalidHeader);
       const invalidList = result.invalid.map(item => 
@@ -260,23 +372,16 @@ class MembershipChecker {
       return [];
     }
 
-    const seen = new Set();
     const buttons = [];
 
-    for (let channel of channels) {
-      if (typeof channel !== 'string') continue;
-      
+    for (const channel of this._dedupeChannels(channels)) {
       const normalized = this._normalizeChannel(channel);
-      
-      if (this._isPrivateChannel(normalized)) {
-        continue;
-      }
+      if (typeof normalized !== 'string' || !normalized) continue;
+      if (this._isPrivateChannel(normalized)) continue;
 
-      if (seen.has(normalized)) continue;
-      seen.add(normalized);
-      
+      const display = this._toDisplayChannel(channel);
       buttons.push([{
-        text: `${buttonPrefix} @${normalized}`,
+        text: `${buttonPrefix} ${display}`,
         url: `https://t.me/${normalized}`
       }]);
     }
@@ -294,22 +399,37 @@ class MembershipChecker {
    * const stats = await checker.getStats(123456789, channels);
    */
   async getStats(userId, channels) {
-    const result = await this.check(userId, channels);
+    const uniqueChannels = this._dedupeChannels(channels);
+    const result = await this.check(userId, uniqueChannels);
     
     return {
-      total: channels.length,
+      // camelCase (backward compatibility)
+      total: uniqueChannels.length,
       joinedCount: result.joined.length,
       leftCount: result.left.length,
       invalidCount: result.invalid.length,
-      percentJoined: (result.joined.length / channels.length) * 100,
+      percentJoined: uniqueChannels.length
+        ? (result.joined.length / uniqueChannels.length) * 100
+        : 0,
       allJoined: result.allJoined,
-      hasIssues: result.left.length > 0 || result.invalid.length > 0
+      hasIssues: result.left.length > 0 || result.invalid.length > 0,
+      
+      // snake_case (new naming convention)
+      total_channels: uniqueChannels.length,
+      joined_count: result.joined.length,
+      left_count: result.left.length,
+      invalid_count: result.invalid.length,
+      percent_joined: uniqueChannels.length
+        ? (result.joined.length / uniqueChannels.length) * 100
+        : 0,
+      all_joined: result.allJoined,
+      has_issues: result.left.length > 0 || result.invalid.length > 0
     };
   }
 }
 
 module.exports = new MembershipChecker();
 
-// last updated: 25/04/26
-// _v: 1.0.0
+// last updated: 09/07/26
+// _v: 1.1.1
 // type: asynchronous
